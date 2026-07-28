@@ -1,24 +1,23 @@
 """
 bot.py
 
-Phase 1: the bare call loop for the Cedar Grove Realty inbound voice agent.
+Phase 2: the Cedar Grove Realty inbound voice agent running its real persona.
 
-Caller dials the Twilio number, Twilio opens a Media Streams WebSocket to this
-process, audio flows through Deepgram to Gemini to ElevenLabs and back out to
-the caller. No tools, no database, no slot filling yet. The only thing this
-file proves is that audio moves in both directions with acceptable latency.
+Phase 1 proved audio moves in both directions. Phase 2 swaps in the full
+real estate intake prompt and verifies the agent holds a coherent multi-turn
+conversation: short replies, memory of earlier turns, no invented listings.
+Still no tools and no database. Those are Phase 3 and 4.
 
-Run it with:
-    uv run bot.py -t twilio
+Two transports are wired:
 
-BEFORE YOU RUN THIS: run 'uv run python check_api.py' first. Pipecat 1.x moved
-several classes between modules and the import block below reflects the layout
-verified against the official examples. If check_api.py reports a different
-path for anything, use its output, not this file.
+    uv run bot.py -t webrtc     browser mic and speakers, no Twilio, no phone
+    uv run bot.py -t twilio     the real phone line, once Twilio is sorted
 
-THE ONE BLOCK YOU MAY NEED TO RECONCILE is marked TRANSPORT BLOCK below. Your
-scaffolded bot.py already contains a transport setup that is correct for your
-exact installed version. If this file's version misbehaves, paste yours in.
+Develop against webrtc. It exercises the same pipeline, the same VAD, and the
+same interruption path as the phone, so Phase 5 barge-in work is testable
+today rather than after the Twilio account is unblocked.
+
+Add -v for verbose logging to see the per-service TTFB metrics.
 """
 
 import os
@@ -29,8 +28,7 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -41,13 +39,14 @@ from pipecat.runner.utils import create_transport
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.google.llm import GoogleLLMService
-from pipecat.transports.base_transport import BaseTransport
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.workers.runner import WorkerRunner
 
-from prompt import PHASE_1_SYSTEM_PROMPT
+from prompt import PHASE_2_SYSTEM_PROMPT
 
-# Small compatibility shim. The FastAPI websocket params class moved during the
-# 1.x reorganisation. Once check_api.py tells you which path your install uses,
-# delete the branch you do not need and keep a single plain import.
+# The FastAPI websocket params class moved during the 1.x reorganisation.
+# Once check_api.py tells you which path your install uses, delete the branch
+# you do not need and keep a single plain import.
 try:
     from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 except ImportError:
@@ -57,14 +56,45 @@ except ImportError:
 load_dotenv(override=True)
 
 
-# Twilio Media Streams carries 8 kHz mono audio. Declaring that here means
-# Pipecat does not resample up and back down for nothing, which costs latency
-# and audio quality for zero benefit.
-TELEPHONY_SAMPLE_RATE = 8000
+# Twilio Media Streams carries 8 kHz mono mu-law. Running the browser transport
+# at the same rate is deliberate: it means the VAD thresholds you tune and the
+# STT accuracy you observe in development are the ones you get on the phone.
+# Browser audio will sound noticeably thin as a result. That is the point.
+#
+# Set AUDIO_SAMPLE_RATE=16000 in .env temporarily if you want to hear how the
+# agent sounds without the telephony bandwidth limit. Do not tune against it.
+# Deepgram still receives 8 kHz so STT accuracy stays representative of the
+# phone. Output must be a rate ElevenLabs actually supports: their PCM formats
+# are 16000, 22050, 24000 and 44100. The only 8 kHz option is ulaw_8000, which
+# is what the TwilioFrameSerializer requests on the telephony path.
+AUDIO_IN_SAMPLE_RATE = int(os.getenv("AUDIO_IN_SAMPLE_RATE", "8000"))
+AUDIO_OUT_SAMPLE_RATE = int(os.getenv("AUDIO_OUT_SAMPLE_RATE", "16000"))
+
+# Transport configuration, keyed by the -t flag. create_transport picks the
+# matching entry. Note there is no vad_analyzer here: in Pipecat 1.x the VAD
+# analyzer belongs to the user aggregator, not the transport. Some reference
+# docstrings still show the old placement.
+transport_params = {
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+    ),
+    "twilio": lambda: FastAPIWebsocketParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        # Twilio wants a raw mu-law stream, not a WAV file with a header on
+        # the front. Leaving this True is a classic cause of audio that sounds
+        # like static or does not play at all. The runner sets this and the
+        # serializer automatically, but being explicit costs nothing.
+        add_wav_header=False,
+    ),
+}
 
 
-async def run_bot(transport: BaseTransport, handle_sigint: bool) -> None:
-    """Assemble and run the voice pipeline for a single inbound call."""
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
+    """Assemble and run the voice pipeline for a single inbound conversation."""
+
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
 
     # Speech to text. Deepgram streams interim and final transcripts as the
     # caller speaks rather than waiting for them to finish, which is most of
@@ -74,20 +104,20 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool) -> None:
     )
 
     # The language model. Gemini Flash is the right class of model here: your
-    # replies are one or two sentences, so time to first token matters far more
-    # than reasoning depth.
+    # replies are one or two sentences, so time to first token matters far
+    # more than reasoning depth. PHASE_2_SYSTEM_PROMPT carries the Cedar Grove
+    # persona, the qualification slots, and the no-invented-listings guardrail.
     language_model = GoogleLLMService(
         api_key=os.getenv("GOOGLE_API_KEY"),
         settings=GoogleLLMService.Settings(
             model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-            system_instruction=PHASE_1_SYSTEM_PROMPT,
+            system_instruction=PHASE_2_SYSTEM_PROMPT,
         ),
     )
 
     # Text to speech. eleven_flash_v2_5 is both the low latency model and the
-    # one that costs half the credits per character, which matters a lot on the
-    # free tier. It is already the ElevenLabs service default, set explicitly so
-    # nobody has to go read the source to find out.
+    # one that costs half the credits per character, which matters a lot on a
+    # 10k credit monthly budget.
     text_to_speech = ElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY"),
         settings=ElevenLabsTTSService.Settings(
@@ -97,17 +127,19 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool) -> None:
     )
 
     # Conversation memory. The context object holds the running message list.
-    # The aggregator pair is what actually writes into it: the user aggregator
-    # appends what the caller said, the assistant aggregator appends what the
-    # bot said, and they sit on opposite sides of the LLM in the pipeline.
-    conversation_context = LLMContext()
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        conversation_context,
+    # The aggregator pair writes into it: the user aggregator appends what the
+    # caller said, the assistant aggregator appends what the bot said, and they
+    # sit on opposite sides of the LLM in the pipeline.
+    #
+    # LLMContextAggregatorPair is an object with .user() and .assistant()
+    # accessors. It is not a 2-tuple and does not unpack.
+    context = LLMContext()
+    aggregators = LLMContextAggregatorPair(
+        context,
         user_params=LLMUserAggregatorParams(
-            # Voice activity detection lives here in Pipecat 1.x, not on the
-            # transport as older tutorials show. This is the component that
-            # decides when the caller has stopped talking, and it is also what
-            # you tune in Phase 5 to get barge-in feeling right.
+            # Voice activity detection lives here in Pipecat 1.x. This is the
+            # component that decides when the caller has stopped talking, and
+            # it is what you tune in Phase 5 to get barge-in feeling right.
             vad_analyzer=SileroVADAnalyzer(),
         ),
     )
@@ -120,74 +152,57 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool) -> None:
         [
             transport.input(),
             speech_to_text,
-            user_aggregator,
+            aggregators.user(),
             language_model,
             text_to_speech,
             transport.output(),
-            assistant_aggregator,
+            aggregators.assistant(),
         ]
     )
 
-    pipeline_task = PipelineTask(
+    agent = PipelineWorker(
         pipeline,
+        name="cedar-grove-intake",
         params=PipelineParams(
             enable_metrics=True,
             enable_usage_metrics=True,
-            audio_in_sample_rate=TELEPHONY_SAMPLE_RATE,
-            audio_out_sample_rate=TELEPHONY_SAMPLE_RATE,
+            audio_in_sample_rate=AUDIO_IN_SAMPLE_RATE,
+            audio_out_sample_rate=AUDIO_OUT_SAMPLE_RATE,
         ),
     )
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         """Caller is on the line. Make the agent speak first."""
-        logger.info("Caller connected, starting conversation")
-        # Queueing an LLMRunFrame with an empty user turn is what makes the
-        # agent greet the caller instead of sitting in silence waiting for
-        # them to speak first. On an inbound line, the agent always opens.
-        await pipeline_task.queue_frame(LLMRunFrame())
+        logger.info("Client connected, starting conversation")
+        # Queueing an LLMRunFrame with no preceding user turn is what makes the
+        # agent greet first instead of sitting in silence. On an inbound line
+        # the agent always opens.
+        await agent.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        """Caller hung up. Tear the pipeline down so we do not leak the task."""
-        logger.info("Caller disconnected, cancelling pipeline")
-        await pipeline_task.cancel()
+        """Caller hung up. Cancel the runner so we do not leak the worker."""
+        logger.info("Client disconnected, cancelling runner")
+        await runner.cancel()
 
-    runner = PipelineRunner(handle_sigint=handle_sigint)
-    await runner.run(pipeline_task)
+    await runner.add_workers(agent)
+    await runner.run()
 
 
 async def bot(runner_args: RunnerArguments):
     """
     Entry point called by Pipecat's development runner.
 
-    The runner owns the FastAPI server, accepts the incoming Twilio WebSocket,
-    parses the Twilio start message for the stream SID and call SID, builds the
-    TwilioFrameSerializer, and hands you a ready transport. This is why there is
-    no hand-written webhook route or serializer wiring in this file.
+    The runner owns the FastAPI server. For twilio it accepts the incoming
+    WebSocket, parses the Twilio start message for the stream SID and call SID,
+    and builds the TwilioFrameSerializer. For webrtc it serves the prebuilt
+    client UI and negotiates the peer connection. Either way it hands back a
+    ready transport, which is why there is no hand-written webhook route or
+    serializer wiring in this file.
     """
-
-    # ------------------------------------------------------------------
-    # TRANSPORT BLOCK
-    # If anything about the connection misbehaves, this is the block to
-    # replace with the one from your scaffolded bot.py.
-    # ------------------------------------------------------------------
-    transport_params = {
-        "twilio": lambda: FastAPIWebsocketParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            # Twilio wants a raw mu-law stream, not a WAV file with a header
-            # bolted on the front. Leaving this True is a classic cause of
-            # audio that sounds like static or does not play at all.
-            add_wav_header=False,
-        ),
-    }
     transport = await create_transport(runner_args, transport_params)
-    # ------------------------------------------------------------------
-    # END TRANSPORT BLOCK
-    # ------------------------------------------------------------------
-
-    await run_bot(transport, runner_args.handle_sigint)
+    await run_bot(transport, runner_args)
 
 
 if __name__ == "__main__":
