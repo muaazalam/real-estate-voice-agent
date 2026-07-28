@@ -224,3 +224,5 @@ __marimo__/
 .env
 .DS_Store
 run.log
+.DS_Store
+run.log
