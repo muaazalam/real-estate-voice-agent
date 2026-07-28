@@ -222,3 +222,5 @@ __marimo__/
 # Node.js (client/)
 .env
 .env
+.DS_Store
+run.log
