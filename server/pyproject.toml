@@ -7,6 +7,7 @@ dependencies = [
     "pipecat-ai-small-webrtc-prebuilt>=2.5.0",
     "pipecat-ai[deepgram,elevenlabs,evals,google,runner,silero,webrtc,websocket]>=1.4.0",
     "twilio>=9.10.9",
+    "aiosqlite>=0.20.0",
 ]
 
 [dependency-groups]

@@ -101,3 +101,63 @@ code.
 If the caller asks for a human, do not deflect and do not loop. Acknowledge it,
 tell them someone will call back, and capture a callback number.
 """.strip()
+
+
+# Phase 3. Same agent, now with somewhere to put what it learns.
+#
+# Built from PHASE_2 rather than rewritten, so the voice constraints, persona
+# and escape hatch stay byte-identical and the Phase 2 acceptance suite keeps
+# testing what it was written to test. Only the tool sections differ.
+PHASE_3_SYSTEM_PROMPT = (
+    PHASE_2_SYSTEM_PROMPT.replace(
+        """# What you can and cannot do on this call
+You have no tools. There is no listing database you can search and no calendar
+you can book into. Nothing arrives later in the call to change that.""",
+        """# What you can and cannot do on this call
+You have ONE tool: save_lead_details, for recording what the caller tells you.
+There is still no listing database you can search and no calendar you can book
+into. Nothing arrives later in the call to change that.
+
+# Saving what you learn, this matters
+Call save_lead_details the moment the caller tells you something new. Do not
+wait until the end of the call, and do not batch several answers up. Callers
+hang up mid-conversation, and anything you have not saved by then is lost, so
+a caller who gave you a budget and an area is worth recording even if you never
+get to ask about financing.
+
+Pass only the fields you just learned. Earlier values are kept for you
+automatically, so there is no need to repeat them.
+
+Never guess or round a value the caller did not actually give you. If they said
+"around four hundred" and you are not certain whether that is four hundred
+thousand, ask before saving rather than assuming.
+
+The tool tells you which details are still missing. Use that to decide what to
+ask next instead of trying to remember what you have already covered.
+
+Saving happens in the background. Keep talking to the caller normally; do not
+announce that you are saving anything, do not narrate it, and do not pause to
+wait for it.""",
+    )
+    .replace(
+        """# Booking
+You cannot book a viewing yourself. Take the caller's preferred day and time,
+tell them an agent will confirm it, and move on. Do not invent a confirmation
+code.""",
+        """# Booking
+You cannot book a viewing yourself. Take the caller's preferred day and time,
+save it with save_lead_details in the notes field, tell them an agent will
+confirm it, and move on. Do not invent a confirmation code.""",
+    )
+)
+
+# A replace() that silently matches nothing would leave the Phase 2 prompt in
+# place and the agent would never call its tool, with no error anywhere. That
+# is the same shape of silent failure as log 013, so assert instead of hoping.
+assert "save_lead_details" in PHASE_3_SYSTEM_PROMPT, (
+    "PHASE_3_SYSTEM_PROMPT was built by editing PHASE_2_SYSTEM_PROMPT and the "
+    "text being replaced no longer matches. Re-sync the blocks above."
+)
+assert "You have no tools." not in PHASE_3_SYSTEM_PROMPT, (
+    "PHASE_3_SYSTEM_PROMPT still tells the agent it has no tools."
+)

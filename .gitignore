@@ -245,8 +245,20 @@ server/evals/_focus.yaml
 # anyone else and would only ever cause merge conflicts.
 server/latency.jsonl
 
-# Local-only working memory, deliberately never committed.
+# Phase 3 database. Created on first run and holds caller data: names, phone
+# numbers, budgets. Never commit it. The schema lives in db.py, which IS
+# committed, so a clone builds an empty database on first boot.
+# The -wal and -shm files are SQLite's write-ahead log companions.
+server/*.db
+server/*.db-wal
+server/*.db-shm
+
+# Local-only working memory, deliberately never committed. PROJECT-STORY.md
+# especially: it contains an honest self-assessment of what I cannot yet
+# defend in an interview, which is exactly the wrong thing to publish next to
+# the code on a public repo.
 # HANDOFF.md is the current state, kept short. ENGINEERING-LOG.md is the
 # append-only archive behind it, so trimming the handoff never loses anything.
 HANDOFF.md
 ENGINEERING-LOG.md
+PROJECT-STORY.md
