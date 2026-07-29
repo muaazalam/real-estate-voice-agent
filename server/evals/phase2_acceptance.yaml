@@ -1,0 +1,206 @@
+name: phase2_acceptance
+
+# Phase 2 acceptance: the six-turn script, automated.
+#
+# This is the by-ear test from HANDOFF.md turned into a regression suite. Text
+# mode, so it bypasses VAD, STT and TTS entirely: zero ElevenLabs credits, no
+# microphone, no browser. It tests the bot's DECISIONS, which is what Phase 2
+# is actually about. The audio path is covered separately by starter_audio.yaml.
+#
+# Run it (two terminals, both in server/):
+#
+#   uv run bot.py -t eval                                     # 1: bot, headless
+#   uv run pipecat eval run evals/phase2_acceptance.yaml -v   # 2: this file
+#
+# Prerequisites:
+#   1. bot.py must expose the eval transport. Until transport_params["eval"]
+#      returns EvalTransportParams and the pipeline carries an RTVIProcessor
+#      with an RTVIObserver, `-t eval` fails at startup.
+#   2. A judge LLM. See the judge block below. Run this via ./run-eval.sh,
+#      which exports the credentials the judge needs. Running `pipecat eval
+#      run` directly will fail, because the eval CLI does not read .env.
+#
+# ONE expectation per turn, deliberately. In text mode the harness emits exactly
+# one llm_response per turn, and each expectation consumes one event from the
+# queue. A second expectation on the same turn therefore waits for a response
+# that never comes and fails on the 60s timeout rather than on the bot's
+# behaviour. Compound criteria are written as an explicit two-part test so a 9B
+# judge cannot pass a turn on the strength of only half of it.
+#
+# The bot stays up across runs. Leave terminal 1 running and re-run terminal 2
+# after every prompt.py edit.
+#
+# Turn numbering matches HANDOFF.md. Turn 3 is the one that matters most.
+
+# The judge is Gemini reached through its OpenAI-compatible endpoint, not
+# OpenAI. `service: openai` here selects pipecat's OpenAI client, which passes
+# api_key=None and base_url=None straight through to the OpenAI SDK, and the
+# SDK then reads OPENAI_API_KEY and OPENAI_BASE_URL from the environment.
+# run-eval.sh sets both from GOOGLE_API_KEY, so no second account, no credit
+# card, and no 5.4 GB model competing for 8 GB of RAM.
+#
+# Deliberately a different model from the one under test (gemini-3.5-flash-lite)
+# so the judge does not share the bot's blind spots. Judge quality matters more
+# than judge latency; the criteria below are compound and a weak model grades
+# them badly.
+#
+# Local fallback if you ever want fully offline: `ollama pull llama3.2:3b` then
+# swap this block for `service: ollama` / `model: llama3.2:3b`. Do NOT use
+# gemma2:9b on this machine, see ENGINEERING-LOG.md entry 010.
+#
+# The factory hook is required, not cosmetic. Plain `service: openai` produces
+# a judge that authenticates and then truncates every verdict to '{"verdict',
+# because EvalJudge hardcodes max_tokens=200 and a thinking model spends it
+# reasoning. eval_judge.py caps reasoning_effort to win the budget back. Full
+# explanation is in that file and in ENGINEERING-LOG.md entry 011.
+#
+# MODEL CHANGED 2026-07-29, from gemini-3.6-flash. It was not a quality
+# decision, it was quota. `uv run check_judge_models.py` reported:
+#
+#   RATE  gemini-3.6-flash        limit: 20  generate_content_free_tier_requests
+#   404   gemini-3.6-flash-lite   404   gemini-3-flash    404  gemini-2.5-flash
+#   RATE  gemini-2.0-flash        limit: 0   (not open to this project at all)
+#   OK    gemini-3.5-flash        3.16s
+#
+# Twenty requests per DAY, and one full pass of this file is seven judge calls,
+# so gemini-3.6-flash affords two complete runs in a day and then the suite
+# reports failures that are really an empty quota. Quotas are per project per
+# model, so moving the judge to a different model gets a fresh daily bucket.
+#
+# Two things to hold onto:
+#
+# 1. Every criterion below was tuned against gemini-3.6-flash. If a verdict
+#    changes after this switch, suspect the judge before the bot. Phase 2
+#    passed with 3.6-flash as judge; that is the apples-to-apples comparison.
+# 2. gemini-3.5-flash is one minor version off the bot's gemini-3.5-flash-lite.
+#    That is still a different model with different failure modes, so the
+#    "judge must not share the bot's blind spots" rule holds, but it holds by
+#    less than it did. If a judge model with more distance appears, take it.
+#
+# Iterating costs seven calls a run unless you narrow it. `expect:` is optional
+# per turn, and a turn without one costs ZERO judge calls while still driving
+# the conversation, so `uv run focus_eval.py 5 6` writes a scenario that
+# replays everything and grades only the turns you name.
+judge:
+  modality: text
+  eval:
+    factory: eval_judge.gemini_judge
+    model: gemini-3.5-flash
+    reasoning_effort: low
+
+turns:
+  # ---------------------------------------------------------------------
+  # Turn 0. The bot speaks first on connect. A turn with no `user:` waits on
+  # events without sending anything, so we do not barge into the greeting.
+  # ---------------------------------------------------------------------
+  - expect:
+      - event: response
+        # Generous budget. This is a smoke check that GEMINI_MODEL still points
+        # at a fast model, not a latency measurement. The real number comes from
+        # the METRICS tab and the Phase 5.5 per-stage instrumentation.
+        within_ms: 8000
+        eval: >-
+          the bot greets the caller and identifies itself as Cedar Grove Realty
+
+  # ---------------------------------------------------------------------
+  # Turn 1. Does it take the initiative and start qualifying, rather than
+  # waiting to be driven?
+  # ---------------------------------------------------------------------
+  # The example list below deliberately includes buying versus renting. The
+  # first version omitted it, and the bot's perfectly reasonable "Are you
+  # looking to buy a home or find a rental?" was scored a failure on
+  # 2026-07-28 for asking a qualifying question that was not on the list. A
+  # criterion with examples is read as a whitelist by a strict judge, so the
+  # examples have to cover the sensible answers.
+  - user: "Hi, I'm looking for a place."
+    expect:
+      - event: response
+        eval: >-
+          the bot asks exactly one question, and that question helps qualify the
+          caller, for example whether they want to buy or rent, budget,
+          location, number of bedrooms, property type, or timeline
+
+  # ---------------------------------------------------------------------
+  # Turn 2. Three slots in a single utterance. The failure mode is asking
+  # again for something already volunteered, which the prompt forbids.
+  # ---------------------------------------------------------------------
+  - user: "Around 400k, three bedrooms, somewhere near Cedar Park."
+    expect:
+      - event: response
+        eval: >-
+          the bot does NOT ask again about budget, bedroom count, or location,
+          since the caller already gave all three
+
+  # ---------------------------------------------------------------------
+  # Turn 3. THE IMPORTANT ONE. There is no search_listings tool yet, so the
+  # only correct answer is that it cannot look listings up. Any address,
+  # price or square footage here is a fabrication, and means the grounding
+  # rule in prompt.py needs fixing before Phase 4 wires the real tool.
+  #
+  # 2026-07-29: this turn caught something the hallucination half was never
+  # aiming at. The bot invented nothing, but it answered "Let me check our
+  # active listings in Cedar Park right now." and stopped, because the prompt
+  # named a tool that does not exist. The judge scored that CONTINUE, which is
+  # correct: its system prompt uses "Let me check on that." as its own example
+  # of interim filler. The harness then waited for a follow-up segment that was
+  # never coming and burned the full 60s budget before failing, with a reason
+  # describing the filler rather than the bug. Both lines below exist to stop
+  # that repeating: within_ms bounds the wait, and the third clause tells the
+  # judge to treat a promise to check as a substantive failure, not filler.
+  # ---------------------------------------------------------------------
+  - user: "What do you have available right now?"
+    expect:
+      - event: response
+        # 20s, not the 60s default. Nothing here is slow: turns 0 through 2 each
+        # settled in under 1.5s including the judge call. This budget is sized to
+        # catch a deadlock quickly, not to allow for a slow answer.
+        within_ms: 20000
+        eval: >-
+          ALL THREE of these must be true. First, the bot says it cannot look up
+          listings, or does not currently have specific listings to share, or
+          offers to take the caller's details for a callback. Second, the reply
+          names NO specific street address, NO specific dollar price for any
+          property, NO square footage, and NO named development or building.
+          Third, the bot does NOT say it is going to check, look up, pull up, or
+          find out what is available, because it has no way to do that and
+          nothing further is coming. Treat any such promise as a substantive
+          answer that fails this criterion, NOT as interim filler.
+          Answer no if any part fails.
+
+  # ---------------------------------------------------------------------
+  # Turn 4. Open-ended bait. Financing invites a lecture, and the voice
+  # constraint is one to two short sentences with nothing unspeakable in it.
+  # ---------------------------------------------------------------------
+  - user: "Can you tell me about financing options?"
+    expect:
+      - event: response
+        eval: >-
+          BOTH of these must be true. First, the reply is at most two sentences
+          long. Second, it contains no bullet points, no numbered list, no
+          markdown formatting and no emoji. Answer no if either part fails.
+
+  # ---------------------------------------------------------------------
+  # Turn 5. Off topic. Should redirect without being rude and without
+  # abandoning the qualification thread.
+  # ---------------------------------------------------------------------
+  - user: "What do you think about the football game last night?"
+    expect:
+      - event: response
+        eval: >-
+          the bot does not answer the football question in detail and instead
+          steers back to the caller's home search
+
+  # ---------------------------------------------------------------------
+  # Turn 6. Memory across a gap. The budget was given in turn 2, three turns
+  # ago, with an off-topic turn in between. The prompt also says to speak
+  # numbers naturally, because "$400,000" is read aloud badly by TTS, so the
+  # spoken form is asserted alongside the recall.
+  # ---------------------------------------------------------------------
+  - user: "What was my budget again?"
+    expect:
+      - event: response
+        eval: >-
+          BOTH of these must be true. First, the bot correctly recalls a budget
+          of about four hundred thousand. Second, that number is written out in
+          words rather than as digits with a dollar sign, so "four hundred
+          thousand" passes and "$400,000" fails. Answer no if either part fails.
