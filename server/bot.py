@@ -28,8 +28,10 @@ Add -v for verbose logging to see the per-service TTFB metrics. Do NOT use it
 on the bot itself, where it enables TRACE and buries everything useful.
 """
 
+import asyncio
 import os
 import sys
+import time
 
 from dotenv import find_dotenv, load_dotenv
 from loguru import logger
@@ -38,13 +40,17 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
     Frame,
+    FunctionCallsStartedFrame,
     InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMRunFrame,
     LLMTextFrame,
     TTSSpeakFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -65,8 +71,15 @@ from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
+from db import Database
 from latency import LatencyRecorder
-from prompt import PHASE_2_SYSTEM_PROMPT
+from prompt import PHASE_3_SYSTEM_PROMPT
+from tools import (
+    REQUIRED_SLOTS,
+    SAVE_LEAD_DETAILS_SCHEMA,
+    CallResources,
+    save_lead_details,
+)
 
 # The FastAPI websocket params class moved during the 1.x reorganisation.
 # Once check_api.py tells you which path your install uses, delete the branch
@@ -205,6 +218,22 @@ AUDIO_OUT_SAMPLE_RATE = int(os.getenv("AUDIO_OUT_SAMPLE_RATE", "16000"))
 # and its spread should collapse.
 SMART_TURN_STOP_SECS = float(os.getenv("SMART_TURN_STOP_SECS", "1.5"))
 
+# How long the caller may sit in silence after they stop speaking before
+# EmptyResponseGuard holds the line for them. This is a DEAD AIR budget, not a
+# latency target: it has to sit above the slowest turn that still works, or it
+# will interrupt healthy conversations.
+#
+# 6.0 is chosen from measurements, not taste. Gemini TTFB p50 is 0.416s and the
+# worst TTFB on a turn that completed correctly was 4.743s (run-phase3b.log).
+# 5.0 would have fired on that turn. Raise this before suspecting anything else
+# if you hear the hold phrase during a normal-sounding call.
+STALL_FILLER_SECS = float(os.getenv("STALL_FILLER_SECS", "6.0"))
+
+# Every tool the agent is told about. Phase 4 appends search_listings and
+# book_viewing here. Defined once so the pipeline and the latency record cannot
+# disagree about how many tools were live on a given run.
+TOOL_SCHEMAS = (SAVE_LEAD_DETAILS_SCHEMA,)
+
 # Transport configuration, keyed by the -t flag. create_transport picks the
 # matching entry. Note there is no vad_analyzer here: in Pipecat 1.x the VAD
 # analyzer belongs to the user aggregator, not the transport. Some reference
@@ -246,52 +275,218 @@ class EmptyResponseGuard(FrameProcessor):
     against 525, and produced 43 tokens. So this is model non-determinism, not a
     malformed context, and it can land on any turn.
 
-    Sits between the LLM and the TTS, watching one response window at a time:
+    BROKEN AND FIXED BY PHASE 3, 2026-07-29. The original version reset its
+    flags on every LLMFullResponseStartFrame, so its unit of judgement was one
+    LLM response window. That was correct while the agent had no tools, and
+    wrong the moment it had one, because a response window with no text stopped
+    meaning "the model failed" and started meaning one of three things:
 
-        LLMFullResponseStartFrame   arm, clear the flags
-        LLMTextFrame                any non-blank text disarms the guard
-        InterruptionFrame           barge-in, an empty response is CORRECT here
-        LLMFullResponseEndFrame     still armed? speak the filler
+      1. The model emitted a FUNCTION CALL instead of text. Entirely normal.
+         Log: `completion tokens: 15` and `Function call: save_lead_details`,
+         with no LLMTextFrame anywhere.
+      2. An async tool result came back and triggered a generation that did
+         nothing at all. Log: `prompt tokens: 0, completion tokens: 0`.
+      3. The model genuinely returned nothing, which is the only case this
+         class exists for.
 
-    TTSSpeakFrame is pushed before the end frame, and defaults to
-    append_to_context=True so the assistant aggregator records what was said.
-    That also stops the context accumulating two consecutive user messages,
-    which is exactly what the bad turn produced.
+    Firing on 1 and 2 meant the caller heard "Sorry, I did not catch that"
+    after almost every sentence, and worse, TTSSpeakFrame appends to context,
+    so the transcript filled with apologies the model then had to reason
+    around. Eight fires in one short conversation.
+
+    THE SECOND ATTEMPT, AND WHY IT ALSO FAILED. Making the unit of judgement
+    one user utterance instead of one response window fixed most of it, 8 false
+    fires down to 3, and was still wrong, because it still DECIDED at the close
+    of a response window:
+
+        User started speaking
+        prompt tokens: 0, completion tokens: 0     <- empty window
+        EmptyResponseGuard fires                    <- premature
+        Function call: save_lead_details            <- the real answer, later
+
+    An empty window is not the end of the turn. With async tools the model's
+    actual response can arrive one or two windows after an empty one, and no
+    amount of flag bookkeeping fixes a decision made too early.
+
+    THE ACTUAL FIX: WAIT.
+
+    The condition this class cares about is "the caller is sitting in silence",
+    and that is a fact about TIME, not about frame order. So an empty window
+    schedules the filler rather than speaking it, and anything that proves the
+    model is alive cancels it. If the model was merely slow or between windows,
+    the timer never expires. If the turn really is dead, the caller hears the
+    filler a beat later than they would have. The original incident had them
+    waiting twelve seconds, so a two second delay costs nothing that matters.
+
+    ATTEMPT 3, AND THE HOLE ATTEMPT 2 LEFT. 2026-07-29, run-phase3c.log.
+    Google's free tier degraded mid-morning: gemini-3.5-flash-lite went from a
+    0.416s p50 TTFB to 30s on a one-word probe, and gemini-3.5-flash returned
+    HTTP 503. The caller said "I'm looking to buy", heard nothing, said
+    "Hello?", heard nothing, said "Are you there?", and hung up after twelve
+    seconds of silence. THE GUARD NEVER FIRED.
+
+    It could not have. Attempt 2 arms its timer on LLMFullResponseEndFrame, so
+    its precondition is "the model finished and said nothing". Here the model
+    had not finished. A request that never comes back never closes a window,
+    never reaches the arming point, and never starts a timer. The guard slept
+    through the exact silence it exists to fill.
+
+    Two failures, identical from the caller's chair, and attempt 2 only saw
+    one:
+
+        window CLOSED with no text   the model answered with nothing
+        window never CLOSED          the model has not answered yet
+
+    So arm at the START of the wait rather than at a point inside it. A user
+    utterance is the only event guaranteed to precede every possible silence,
+    so UserStoppedSpeakingFrame arms a long STALL deadline, and a window that
+    closes empty SHORTENS that deadline to the old two seconds, because a
+    closed empty window is positive evidence rather than an absence of news.
+    A deadline is only ever moved earlier, never later.
+
+        UserStoppedSpeakingFrame    new utterance: clear, then ARM (stall)
+        LLMTextFrame                model spoke, cancel
+        FunctionCallsStartedFrame   model acted, cancel
+        InterruptionFrame           barge-in, an empty response is CORRECT
+        LLMFullResponseEndFrame     nothing yet? SHORTEN to silence_secs
+        EndFrame / CancelFrame      teardown, cancel
+
+    The two cases also deserve different words. "Sorry, I did not catch that"
+    asks the caller to repeat themselves, which is right when the model
+    produced nothing and wrong when it is merely slow: it heard them fine. A
+    stall gets a neutral hold instead, which buys time without lying and
+    without asking for anything back.
+
+    TTSSpeakFrame defaults to append_to_context=True so the assistant
+    aggregator records what was said, which also stops the context
+    accumulating two consecutive user messages, the fingerprint of the bug
+    this class was written for. run-phase3c.log shows that fingerprint in its
+    purest form: three consecutive 'user' parts and no 'model' between them.
     """
 
-    def __init__(self, filler: str, **kwargs):
+    def __init__(
+        self,
+        filler: str,
+        stall_filler: str,
+        silence_secs: float = 2.0,
+        stall_secs: float = STALL_FILLER_SECS,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._filler = filler
+        self._stall_filler = stall_filler
+        self._silence_secs = silence_secs
+        self._stall_secs = stall_secs
         self._responding = False
         self._saw_text = False
+        self._saw_function_call = False
         self._interrupted = False
+        self._fired_this_utterance = False
+        self._pending: asyncio.Task | None = None
+        self._deadline: float = 0.0
+
+    async def _cancel_pending(self) -> None:
+        if self._pending is not None:
+            await self.cancel_task(self._pending)
+            self._pending = None
+            self._deadline = 0.0
+
+    async def _arm(self, delay: float, text: str, direction: FrameDirection) -> None:
+        """
+        Schedule the filler for `delay` seconds from now.
+
+        Monotonic ABSOLUTE deadlines, not durations, and a deadline is only
+        ever moved EARLIER. Both matter. The empty-window path re-arms an
+        already-running stall timer, and re-arming with a duration would let a
+        window that closed late push the filler further out than the stall
+        timer had it, which is backwards: closing empty is worse news than not
+        closing at all, so it must never buy the model more time.
+        """
+        if self._fired_this_utterance or self._interrupted:
+            return
+        deadline = time.monotonic() + delay
+        if self._pending is not None:
+            if deadline >= self._deadline:
+                return
+            await self._cancel_pending()
+        self._deadline = deadline
+        self._pending = self.create_task(
+            self._speak_at(deadline, text, direction),
+            name="empty-response-filler",
+        )
+
+    async def _speak_at(
+        self, deadline: float, text: str, direction: FrameDirection
+    ) -> None:
+        """Wait out the silence, then fill it if nothing has arrived."""
+        await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+        if self._interrupted or self._fired_this_utterance:
+            return
+        logger.warning(
+            f"EmptyResponseGuard: silence with no text and no tool call, "
+            f"speaking filler: {text!r}"
+        )
+        self._fired_this_utterance = True
+        await self.push_frame(TTSSpeakFrame(text), direction)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, LLMFullResponseStartFrame):
-            self._responding = True
+        # Two mechanisms, and both are needed. The FLAGS stop a timer being
+        # started when the model already answered inside this window. The TIMER
+        # covers the case the flags cannot see, where the answer lands in a
+        # LATER window. An earlier version had only the timer, and cancelling
+        # on text did nothing because the timer is not created until the end
+        # frame, which is after the text: every normal reply got a filler.
+        if isinstance(frame, UserStoppedSpeakingFrame):
+            # New utterance. Whatever was pending belonged to the last one.
+            await self._cancel_pending()
             self._saw_text = False
+            self._saw_function_call = False
             self._interrupted = False
+            self._fired_this_utterance = False
+            # Arm the stall watchdog. This is the only arming point that is
+            # guaranteed to be reached, because it does not depend on the LLM
+            # doing anything at all. See "ATTEMPT 3" in the class docstring.
+            await self._arm(self._stall_secs, self._stall_filler, direction)
+
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            self._responding = True
 
         elif isinstance(frame, LLMTextFrame):
             # Whitespace-only deltas are common while streaming and must not
             # count as a real answer.
             if frame.text and frame.text.strip():
                 self._saw_text = True
+                await self._cancel_pending()
+
+        elif isinstance(frame, FunctionCallsStartedFrame):
+            # Broadcast downstream from run_function_calls, which the LLM
+            # service calls BEFORE pushing LLMFullResponseEndFrame. The model
+            # is working; the caller is not being abandoned.
+            self._saw_function_call = True
+            await self._cancel_pending()
 
         elif isinstance(frame, InterruptionFrame):
             # The caller barged in, so the truncated or empty response is the
             # intended outcome. Speaking a filler here would talk over them.
             self._interrupted = True
+            await self._cancel_pending()
+
+        elif isinstance(frame, (EndFrame, CancelFrame)):
+            # Never leave a timer running into teardown, or the filler fires
+            # into a pipeline that is already closing.
+            await self._cancel_pending()
 
         elif isinstance(frame, LLMFullResponseEndFrame):
-            if self._responding and not self._saw_text and not self._interrupted:
-                logger.warning(
-                    "EmptyResponseGuard: LLM produced no text for this turn, "
-                    f"speaking filler instead of going silent: {self._filler!r}"
-                )
-                await self.push_frame(TTSSpeakFrame(self._filler), direction)
+            # A window that closed with nothing in it is positive evidence,
+            # not merely an absence of news, so it SHORTENS the stall deadline
+            # to silence_secs. _arm refuses to move a deadline later, so a
+            # window that closes empty after the stall timer is already most
+            # of the way through cannot reprieve it.
+            nothing_yet = not self._saw_text and not self._saw_function_call
+            if self._responding and nothing_yet:
+                await self._arm(self._silence_secs, self._filler, direction)
             self._responding = False
 
         await self.push_frame(frame, direction)
@@ -381,14 +576,45 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         api_key=os.environ["GOOGLE_API_KEY"],
         settings=GoogleLLMService.Settings(
             model=os.environ["GEMINI_MODEL"],
-            system_instruction=PHASE_2_SYSTEM_PROMPT,
+            system_instruction=PHASE_3_SYSTEM_PROMPT,
         ),
     )
 
-    # Catches the turn where the model returns zero completion tokens. See the
-    # class docstring for the exact log lines that motivated it.
+    # Registered explicitly rather than by attaching the handler to the schema,
+    # because the schema route registers with default options and the option
+    # that matters here is not the default.
+    #
+    # cancel_on_interruption=False is pipecat's name for "asynchronous": the
+    # LLM continues talking immediately instead of waiting for the result. That
+    # is what makes saving on every new fact affordable. Nothing the agent says
+    # next depends on whether the row was written, so making the caller wait
+    # for a disk write plus a second round trip would spend the entire Phase
+    # 5.5 latency win on nothing.
+    language_model.register_function(
+        "save_lead_details",
+        save_lead_details,
+        cancel_on_interruption=False,
+    )
+
+    # One database and one call row per conversation. Opened here rather than
+    # at import so a failure to open is scoped to this call instead of taking
+    # the whole server down.
+    database = Database()
+    await database.connect()
+    call_id = await database.start_call(transport=_transport_label(runner_args))
+    call_resources = CallResources(db=database, call_id=call_id)
+
+    # Catches both ways the caller ends up in silence: the model returning zero
+    # completion tokens, and the model not returning at all. See the class
+    # docstring for the exact log lines that motivated each.
+    #
+    # The two fillers are deliberately different. Asking someone to repeat
+    # themselves is right when the model produced nothing and wrong when it is
+    # just slow, because it heard them perfectly well. Neither line promises an
+    # action, which is the rule from log 013.
     empty_response_guard = EmptyResponseGuard(
-        filler="Sorry, I did not catch that. Could you say it again?"
+        filler="Sorry, I did not catch that. Could you say it again?",
+        stall_filler="One moment, please.",
     )
 
     # Text to speech. eleven_flash_v2_5 is both the low latency model and the
@@ -409,7 +635,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     #
     # LLMContextAggregatorPair is an object with .user() and .assistant()
     # accessors. It is not a 2-tuple and does not unpack.
-    context = LLMContext()
+    # The tools list is what ADVERTISES the function to Gemini. Registering the
+    # handler above only says what to run if it is called; without the schema
+    # here the model never learns the tool exists and will never call it.
+    context = LLMContext(tools=list(TOOL_SCHEMAS))
     aggregators = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -496,7 +725,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         transport=_transport_label(runner_args),
         # Anything tuned per run belongs here, or `uv run latency.py` pools two
         # different experiments under one heading and averages away the effect.
-        config={"stop_secs": SMART_TURN_STOP_SECS},
+        # `tools` is in here because adding one changes what the model has to
+        # generate on a turn, so pre-tool and post-tool runs are not comparable
+        # and must not share a heading.
+        config={"stop_secs": SMART_TURN_STOP_SECS, "tools": len(TOOL_SCHEMAS)},
     )
     latency_recorder.attach(latency_observer)
 
@@ -510,6 +742,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             audio_out_sample_rate=AUDIO_OUT_SAMPLE_RATE,
         ),
         observers=[latency_observer],
+        # Handed to every tool handler as FunctionCallParams.app_resources, by
+        # reference, so all of this call's tools share one connection and one
+        # call_id.
+        app_resources=call_resources,
         **worker_kwargs,
     )
 
@@ -540,6 +776,21 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             latency_recorder.write_samples()
         except Exception as e:
             logger.warning(f"Latency reporting failed, continuing teardown: {e!r}")
+
+        # Close the call row and the connection. Separately wrapped from the
+        # latency block above: a reporting failure must not be the reason a
+        # lead's call never gets stamped as finished.
+        try:
+            lead = await database.get_lead(call_id)
+            logger.info(
+                f"Call {call_id} captured lead: {lead['id'] if lead else 'NONE'}"
+                + (f", still missing {await database.missing_fields(call_id, REQUIRED_SLOTS)}"
+                   if lead else "")
+            )
+            await database.end_call(call_id)
+            await database.close()
+        except Exception as e:
+            logger.warning(f"Database teardown failed: {e!r}")
 
         await runner.cancel()
 
